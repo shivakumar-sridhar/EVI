@@ -9,6 +9,10 @@ from pydantic import ValidationError
 
 from evee.cad import PART_GAP, arrange_along_x, design, render_preview
 from evee.config import bed_violations
+import os
+import importlib
+from pathlib import Path
+
 from evee.templates import TEMPLATE_REGISTRY, UnknownTemplateError, get_template
 
 ACCEPTANCE = dict(outer_l=50.0, outer_w=40.0, outer_h=20.0)
@@ -325,3 +329,119 @@ def test_render_preview_can_write_elsewhere(tmp_path):
     elsewhere = tmp_path / "previews"
     pngs = render_preview(out.stl_paths["body"], output_dir=elsewhere)
     assert all(p.parent == elsewhere for p in pngs)
+
+
+# --------------------------------------------------------------------------- #
+# Picking up edited templates without a restart
+# --------------------------------------------------------------------------- #
+
+
+def test_a_changed_template_source_is_reloaded(tmp_path):
+    """The whole point: an edited template reaches a running server.
+
+    Touching the mtime is enough — the reload is driven by the stat, not by a diff,
+    so this exercises the real path without writing to a source file.
+    """
+    import evee.templates as templates
+
+    source = Path(templates.__file__).resolve().parent / "gear.py"
+    before = templates.template_registry()
+    original = source.stat()
+
+    try:
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000))
+        after = templates.template_registry()
+    finally:
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        templates.refresh()
+
+    # A reload rebuilds the registry, so the dict itself is a different object...
+    assert after is not before
+    # ...carrying the same templates, built from the freshly imported modules.
+    assert sorted(after) == sorted(before)
+
+
+def test_an_untouched_registry_is_not_rebuilt_on_every_lookup():
+    """Reloading OpenCascade-backed modules is not free, and a design tool calls
+    this on every request."""
+    import evee.templates as templates
+
+    templates.refresh()
+    first = templates.template_registry()
+    second = templates.template_registry()
+    assert first is second
+
+
+@pytest.mark.parametrize("module_name", ["evee.cad", "evee.server"])
+def test_no_module_binds_the_registry_dict(module_name):
+    """A reload rebinds TEMPLATE_REGISTRY to a new dict, so anything holding the old
+    one silently stops seeing new templates — the same shape of bug as patching a
+    name at its definition site while the caller holds the value.
+
+    Enforced by introspection rather than by a comment, because a comment is not a
+    mechanism and this one costs a client restart to discover.
+    """
+    module = importlib.import_module(module_name)
+    # The live dict, not the one this test file imported — a reload since then
+    # would have left that one stale and the check would pass on nothing.
+    live = importlib.import_module("evee.templates").TEMPLATE_REGISTRY
+
+    bound = [name for name, value in vars(module).items() if value is live]
+    assert not bound, f"{module_name} binds the registry dict as {bound}"
+    assert "TEMPLATE_REGISTRY" not in vars(module), (
+        f"{module_name} imports TEMPLATE_REGISTRY by name; use template_registry()"
+    )
+
+
+def test_a_reload_drops_cached_bytecode_first(tmp_path, monkeypatch):
+    """Two saves inside one second, same file length, must not serve stale code.
+
+    Python validates a .pyc against the source's mtime in whole SECONDS and its
+    size. Rename a string without changing its length, twice in a second, and the
+    loader happily reuses the previous bytecode — reload appears to work and serves
+    the older code. This caught exactly that, with a .pyc left behind proving it.
+    """
+    import evee.templates as templates
+
+    module = tmp_path / "scratch_template.py"
+    module.write_text("VALUE = 'aaa'\n")
+
+    spec = importlib.util.spec_from_file_location("scratch_template", module)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    cached = Path(importlib.util.cache_from_source(str(module)))
+    cached.parent.mkdir(exist_ok=True)
+    cached.write_bytes(b"stale")
+
+    monkeypatch.setattr(templates, "_PACKAGE_DIR", tmp_path)
+    templates._drop_bytecode()
+
+    assert not cached.exists(), "stale bytecode survived, so a reload could serve it"
+
+
+def test_except_clauses_still_catch_after_a_reload():
+    """The hazard hot-reloading brings with it, and the reason errors.py exists.
+
+    importlib.reload mints NEW class objects. Anything holding `except TemplateError`
+    from before the reload no longer matches what a freshly reloaded template raises,
+    so a tidy validation message becomes an unhandled exception — and only on the
+    first call after an edit, which is the hardest kind of bug to catch in the act.
+
+    This is not hypothetical: adding the reload broke twenty tests in exactly this
+    way, all of which passed when run alone.
+    """
+    import evee.templates as templates
+    from evee.templates.errors import TemplateError
+    from evee.templates.gear import gear_pair
+
+    source = Path(templates.__file__).resolve().parent / "gear.py"
+    original = source.stat()
+    try:
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000))
+        templates.refresh()
+
+        with pytest.raises(TemplateError):
+            gear_pair(module=0.8, gear_teeth=23, pinion_teeth=12, thickness=-1.0)
+    finally:
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        templates.refresh()

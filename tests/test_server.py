@@ -72,6 +72,10 @@ def test_exposed_tools_are_the_gated_steps(server):
     assert names == {
         "list_templates",
         "design_part",
+        # Reads the design ledger. Moves nothing and gates nothing — it exists so a
+        # client iterating on an existing part looks its parameters up instead of
+        # reconstructing them from a mesh, which cannot recover a defaulted value.
+        "design_history",
         "slice_part",
         "get_printer_status",
         "start_print",

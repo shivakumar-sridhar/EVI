@@ -23,9 +23,17 @@ Geometry notes (see CLAUDE.md for why these override BUILD_PLAN.md's text):
 
 * **Standoffs are added last, and their screw holes are blind.** A standoff is a
   cylindrical post on the cavity floor that a PCB sits on. Its hole stops short
-  of the floor, so the base of the box is never perforated, and the post itself
+  of the floor, so a standoff never perforates the base, and the post itself
   is sunk slightly into the floor so the union has no coincident faces. Posts
   print without support — they rise straight off the floor in print pose.
+
+* **A floor hole is the one thing that does go through.** ``floor_holes`` cuts
+  plain cylinders through the base, open on the inside and on the outside — for a
+  magnet, a sensor window, a shaft or a cable gland. Everything else in this
+  template deliberately leaves the base solid, so this is opt-in, is kept clear of
+  the standoffs, and leaves a margin of floor between itself and the wall root.
+  Printed flat on the bed a hole in the floor needs no support and no bridging;
+  the first layer simply has a ring in it.
 
 Cross-section, press_fit::
 
@@ -45,13 +53,14 @@ Elevation of a walled face carrying one port::
    |        |          |        |
    +--------+          +--------+  <- port bottom = cavity floor + z_offset
 
-Section through two standoffs carrying a board::
+Section through two standoffs carrying a board, and one floor hole::
 
    |      :  :            :  :      |  <- pilot holes, stopping above the floor
    |     +----+          +----+     |  <- post top = board underside
    |     |    |  height  |    |     |
    +-----+----+----------+----+-----+  <- cavity floor
-   +--------------------------------+  <- base, never perforated
+   +---------------+  +-------------+  <- base, open only where a floor hole asks
+                   |  |                <- floor hole: diameter, straight through
 """
 
 from __future__ import annotations
@@ -65,8 +74,11 @@ from build123d import (
     Cylinder,
     Location,
     Part,
+    RegularPolygon,
+    extrude,
     fillet as fillet_edges,
 )
+from evee.templates.errors import TemplateError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from evee.config import (
@@ -77,6 +89,8 @@ from evee.config import (
 
 __all__ = [
     "BoxWithLidParams",
+    "FloorHoleSpec",
+    "FloorSlotSpec",
     "PART_NAMES",
     "PortSpec",
     "StandoffSpec",
@@ -93,6 +107,14 @@ LidStyle = Literal["press_fit", "sliding"]
 #: Which wall a port is cut through. left/right are the ends of ``outer_l`` (the
 #: +/-X faces); front/back are the ends of ``outer_w`` (the -/+Y faces).
 PortSide = Literal["left", "right", "front", "back"]
+
+#: Cross-section of a hole through the base. "hex" is for hex hardware — a spacer
+#: or a nut seated in the hole cannot then turn, which a round hole cannot stop.
+FloorHoleShape = Literal["round", "hex"]
+
+#: Across-flats to across-corners for a regular hexagon. The corners are what has
+#: to clear a wall, so every fit check uses this and never the across-flats size.
+_HEX_CORNER_RATIO = 2.0 / (3.0**0.5)
 
 #: Radii below this are treated as "no fillet" — OCC rejects a zero-radius fillet.
 _MIN_FILLET = 1e-6
@@ -116,9 +138,9 @@ _BOSS_HOLE_STOP = 0.5
 #: A post shorter than this cannot hold a screw thread worth cutting.
 _MIN_SCREW_BOSS_HEIGHT = 1.5
 
-
-class TemplateError(ValueError):
-    """Requested parameters cannot produce valid geometry."""
+#: Floor left between a floor hole and the root of a wall. Any less and the hole
+#: breaks into the fillet at the wall's base, which is where the box is stiffest.
+_MIN_FLOOR_HOLE_WALL = 0.8
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +217,79 @@ class StandoffSpec(BaseModel):
         description=(
             "Pilot hole diameter in mm for a self-tapping screw (2.1 for M2.5, "
             "1.7 for M2). 0 makes a solid spacer with no screw hole."
+        ),
+    )
+
+
+class FloorHoleSpec(BaseModel):
+    """One cylindrical hole straight through the base, open on both faces.
+
+    Unlike a :class:`StandoffSpec` bore — which is blind, and stops short of the
+    floor so the base stays solid — this one is meant to come out the other side.
+    Use it for a magnet, a sensor window, a shaft, a cable gland, or a screw that
+    fastens the box down to something underneath it.
+
+    Positions use the same convention as :class:`StandoffSpec`: measured from the
+    centre of the cavity floor, which is also the centre of the box.
+
+    ``shape="hex"`` seats hex hardware — a spacer or a nut dropped in cannot turn,
+    which is the whole reason to prefer it over a round hole of the same size.
+
+    ``diameter`` is the hole, not the thing going through it. A part that has to
+    stay put wants the hole a couple of tenths over its own size, not the house
+    press-fit clearance, which is sized for the lid lip's much larger contact area.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(description="Hole centre in mm along X, measured from the centre.")
+    y: float = Field(description="Hole centre in mm along Y, measured from the centre.")
+    diameter: float = Field(
+        gt=0,
+        description=(
+            "Size of the hole in mm. Round: the diameter. Hex: the distance ACROSS "
+            "THE FLATS, which is how hex hardware is specified — an M2.5 hex spacer "
+            "is 5mm across the flats, so 5.2 here seats it snugly. Either way this "
+            "is the hole itself: for a part that must sit in it, add about 0.2mm to "
+            "the part's own size."
+        ),
+    )
+    shape: FloorHoleShape = Field(
+        default="round",
+        description=(
+            "round: a plain drilled hole. hex: a hexagonal socket that stops hex "
+            "hardware turning. A hex hole reaches further than its across-flats "
+            "size suggests — 15% further at the corners."
+        ),
+    )
+
+
+class FloorSlotSpec(BaseModel):
+    """A rectangular opening straight through the base.
+
+    What a round hole cannot do: clear something long. A board mounted face-down
+    puts its connectors against the floor and holds itself off it, and the fix is a
+    slot the connectors drop into rather than three separate holes that have to be
+    positioned to a tenth.
+
+    Positions and sizes use the same convention as everything else on the floor:
+    measured from the centre of the cavity floor, ``length`` along X, ``width``
+    along Y.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(description="Slot centre in mm along X, from the centre.")
+    y: float = Field(description="Slot centre in mm along Y, from the centre.")
+    length: float = Field(
+        gt=0, description="Slot size in mm along X — usually the long way."
+    )
+    width: float = Field(
+        gt=0,
+        description=(
+            "Slot size in mm along Y. Size it to the widest thing that has to pass "
+            "through, plus a little: a connector shell that catches on the edge "
+            "holds the board off the floor just as effectively as no slot at all."
         ),
     )
 
@@ -312,6 +407,25 @@ class BoxWithLidParams(BaseModel):
         ),
     )
 
+    floor_holes: list[FloorHoleSpec] = Field(
+        default_factory=list,
+        description=(
+            "Cylindrical holes cut straight through the base, open on the inside "
+            "and the outside — for a magnet, a sensor window, a shaft or a cable "
+            "gland. Empty means a solid base, which is the default everywhere else "
+            "in this template. Kept clear of standoffs."
+        ),
+    )
+
+    floor_slots: list[FloorSlotSpec] = Field(
+        default_factory=list,
+        description=(
+            "Rectangular openings cut straight through the base, for clearing "
+            "connectors or anything else too long for a round hole. Kept clear of "
+            "floor holes and standoffs."
+        ),
+    )
+
     lid_posts: list[LidPostSpec] = Field(
         default_factory=list,
         description=(
@@ -333,6 +447,9 @@ class BoxWithLidParams(BaseModel):
             self.lip_height,
             self.ports,
             self.standoffs,
+            self.lid_posts,
+            self.floor_holes,
+            self.floor_slots,
         )
         return self
 
@@ -348,6 +465,8 @@ def _validate(
     ports: "list[PortSpec] | None" = None,
     standoffs: "list[StandoffSpec] | None" = None,
     lid_posts: "list[LidPostSpec] | None" = None,
+    floor_holes: "list[FloorHoleSpec] | None" = None,
+    floor_slots: "list[FloorSlotSpec] | None" = None,
 ) -> None:
     """Cross-field checks. Raises :class:`TemplateError` naming the bad values.
 
@@ -408,6 +527,17 @@ def _validate(
     for index, post in enumerate(lid_posts):
         _validate_lid_post(index, post, outer_l, outer_w, outer_h, wall, clearance)
     _validate_lid_posts_disjoint(lid_posts)
+
+    floor_holes = list(floor_holes or ())
+    for index, hole in enumerate(floor_holes):
+        _validate_floor_hole(index, hole, outer_l, outer_w, wall)
+    _validate_floor_holes_disjoint(floor_holes)
+    _validate_floor_holes_clear_of_standoffs(floor_holes, standoffs)
+
+    floor_slots = list(floor_slots or ())
+    for index, slot in enumerate(floor_slots):
+        _validate_floor_slot(index, slot, outer_l, outer_w, wall)
+    _validate_floor_slots_clear(floor_slots, floor_holes, standoffs)
 
 
 def _validate_port(
@@ -566,6 +696,176 @@ def _validate_lid_posts_disjoint(posts: "list[LidPostSpec]") -> None:
                 )
 
 
+def _floor_hole_radius(hole: "FloorHoleSpec") -> float:
+    """Half the widest the hole gets — the circumradius, for a hex.
+
+    Every fit check goes through this. A hex quoted at 5.2mm across the flats
+    actually reaches 6mm across the corners, and a check written against the
+    across-flats number would let it eat into a wall by 0.4mm on each side.
+    """
+    if hole.shape == "hex":
+        return hole.diameter * _HEX_CORNER_RATIO / 2
+    return hole.diameter / 2
+
+
+def _validate_floor_hole(
+    index: int,
+    hole: "FloorHoleSpec",
+    outer_l: float,
+    outer_w: float,
+    wall: float,
+) -> None:
+    """Keep a floor hole inside the floor, with material left at the wall root."""
+    where = f"floor_holes[{index}] at ({_fmt(hole.x)}, {_fmt(hole.y)})"
+
+    if hole.diameter <= 0:
+        raise TemplateError(f"{where}: diameter must be positive, got {hole.diameter}mm")
+
+    radius = _floor_hole_radius(hole)
+    for axis, position, inner_span in (
+        ("X", hole.x, outer_l - 2 * wall),
+        ("Y", hole.y, outer_w - 2 * wall),
+    ):
+        reach = abs(position) + radius + _MIN_FLOOR_HOLE_WALL
+        if reach > inner_span / 2:
+            corners = (
+                f" ({_fmt(2 * radius)}mm across the corners)"
+                if hole.shape == "hex"
+                else ""
+            )
+            raise TemplateError(
+                f"{where}: a {hole.diameter}mm {hole.shape} hole{corners} reaches "
+                f"{_fmt(reach)}mm from centre on {axis} (including "
+                f"{_MIN_FLOOR_HOLE_WALL}mm of floor at the wall root) but the floor "
+                f"only runs to {_fmt(inner_span / 2)}mm (move it in, shrink "
+                f"diameter, or raise the outer dimension)"
+            )
+
+
+def _slot_gap(slot: "FloorSlotSpec", x: float, y: float, radius: float) -> float:
+    """Clearance in mm between a round feature and a slot's rectangle.
+
+    Distance from the feature's centre to the nearest point ON the rectangle, less
+    its radius. Negative means they overlap. Clamping to the rectangle is what makes
+    a corner behave: measuring to the slot's centre would say a feature beside a
+    long slot is miles away.
+    """
+    nearest_x = min(max(x, slot.x - slot.length / 2), slot.x + slot.length / 2)
+    nearest_y = min(max(y, slot.y - slot.width / 2), slot.y + slot.width / 2)
+    return ((x - nearest_x) ** 2 + (y - nearest_y) ** 2) ** 0.5 - radius
+
+
+def _validate_floor_slot(
+    index: int,
+    slot: "FloorSlotSpec",
+    outer_l: float,
+    outer_w: float,
+    wall: float,
+) -> None:
+    """Keep a slot inside the floor, with material left at the wall root."""
+    where = f"floor_slots[{index}] at ({_fmt(slot.x)}, {_fmt(slot.y)})"
+
+    for axis, position, size, inner_span in (
+        ("X", slot.x, slot.length, outer_l - 2 * wall),
+        ("Y", slot.y, slot.width, outer_w - 2 * wall),
+    ):
+        reach = abs(position) + size / 2 + _MIN_FLOOR_HOLE_WALL
+        if reach > inner_span / 2:
+            raise TemplateError(
+                f"{where}: a {_fmt(slot.length)}x{_fmt(slot.width)}mm slot reaches "
+                f"{_fmt(reach)}mm from centre on {axis} (including "
+                f"{_MIN_FLOOR_HOLE_WALL}mm of floor at the wall root) but the floor "
+                f"only runs to {_fmt(inner_span / 2)}mm"
+            )
+
+
+def _validate_floor_slots_clear(
+    slots: "list[FloorSlotSpec]",
+    holes: "list[FloorHoleSpec]",
+    standoffs: "list[StandoffSpec]",
+) -> None:
+    """Reject a slot that runs into a hole, a standoff, or another slot.
+
+    The gap has to be real material, not merely a non-overlap: two openings a tenth
+    of a millimetre apart are one opening once a 0.4mm nozzle has been over it, and
+    the part that comes out is not the part that was checked.
+    """
+    for i, slot in enumerate(slots):
+        for j, hole in enumerate(holes):
+            gap = _slot_gap(slot, hole.x, hole.y, _floor_hole_radius(hole))
+            if gap < _MIN_FLOOR_HOLE_WALL:
+                raise TemplateError(
+                    f"floor_slots[{i}] leaves {_fmt(gap)}mm of floor to "
+                    f"floor_holes[{j}] at ({_fmt(hole.x)}, {_fmt(hole.y)}), under "
+                    f"the {_MIN_FLOOR_HOLE_WALL}mm minimum — at that thickness the "
+                    f"two become one opening on the printer (narrow the slot, "
+                    f"shrink the hole, or move one of them)"
+                )
+
+        for j, standoff in enumerate(standoffs):
+            gap = _slot_gap(slot, standoff.x, standoff.y, standoff.diameter / 2)
+            if gap < _MIN_FLOOR_HOLE_WALL:
+                raise TemplateError(
+                    f"floor_slots[{i}] undercuts standoffs[{j}] at "
+                    f"({_fmt(standoff.x)}, {_fmt(standoff.y)}): {_fmt(gap)}mm of "
+                    f"floor between them, under {_MIN_FLOOR_HOLE_WALL}mm"
+                )
+
+        for j, other in enumerate(slots[i + 1 :], start=i + 1):
+            overlap_x = (
+                abs(slot.x - other.x) < (slot.length + other.length) / 2
+                + _MIN_FLOOR_HOLE_WALL
+            )
+            overlap_y = (
+                abs(slot.y - other.y) < (slot.width + other.width) / 2
+                + _MIN_FLOOR_HOLE_WALL
+            )
+            if overlap_x and overlap_y:
+                raise TemplateError(
+                    f"floor_slots[{i}] and floor_slots[{j}] are closer than "
+                    f"{_MIN_FLOOR_HOLE_WALL}mm and would run into each other"
+                )
+
+
+def _validate_floor_holes_disjoint(holes: "list[FloorHoleSpec]") -> None:
+    """Reject overlapping holes — two merged bores are not the hole either asked for."""
+    for i, first in enumerate(holes):
+        for j, second in enumerate(holes[i + 1 :], start=i + 1):
+            gap = ((first.x - second.x) ** 2 + (first.y - second.y) ** 2) ** 0.5
+            touching = _floor_hole_radius(first) + _floor_hole_radius(second)
+            if gap < touching:
+                raise TemplateError(
+                    f"floor_holes[{i}] at ({_fmt(first.x)}, {_fmt(first.y)}) and "
+                    f"floor_holes[{j}] at ({_fmt(second.x)}, {_fmt(second.y)}) are "
+                    f"{_fmt(gap)}mm apart and would run into each other "
+                    f"(need at least {_fmt(touching)}mm)"
+                )
+
+
+def _validate_floor_holes_clear_of_standoffs(
+    holes: "list[FloorHoleSpec]", standoffs: "list[StandoffSpec]"
+) -> None:
+    """Reject a floor hole that eats into a standoff.
+
+    A standoff's own bore is blind by design, and a floor hole clipping the side of
+    a post would leave a crescent of plastic holding a screw — worse than either
+    feature on its own. Full containment is refused too: a post with a hole straight
+    through it is a different feature, and this one does not claim to be it.
+    """
+    for i, hole in enumerate(holes):
+        for j, standoff in enumerate(standoffs):
+            gap = ((hole.x - standoff.x) ** 2 + (hole.y - standoff.y) ** 2) ** 0.5
+            touching = _floor_hole_radius(hole) + standoff.diameter / 2
+            if gap < touching:
+                raise TemplateError(
+                    f"floor_holes[{i}] at ({_fmt(hole.x)}, {_fmt(hole.y)}) would cut "
+                    f"into standoffs[{j}] at ({_fmt(standoff.x)}, {_fmt(standoff.y)}) "
+                    f"— {_fmt(gap)}mm apart, needs {_fmt(touching)}mm. A floor hole "
+                    f"goes right through the base; a standoff's own screw hole is "
+                    f"blind and stays inside the post. Move one, or drop the standoff"
+                )
+
+
 def _validate_standoffs_disjoint(standoffs: "list[StandoffSpec]") -> None:
     """Reject posts that intersect each other — a merged blob is not a mount."""
     for i, first in enumerate(standoffs):
@@ -623,6 +923,8 @@ def resolved_spec_sentence(params: BoxWithLidParams) -> str:
         f"Usable interior {_fmt(inner_l)}x{_fmt(inner_w)}x{_fmt(inner_h)}mm."
         f"{_ports_phrase(params.ports)}"
         f"{_standoffs_phrase(params.standoffs, inner_h, params.lip_height)}"
+        f"{_floor_holes_phrase(params.floor_holes, params.wall)}"
+        f"{_floor_slots_phrase(params.floor_slots, params.wall)}"
         f"{_lid_posts_phrase(params.lid_posts)}"
     )
 
@@ -642,6 +944,50 @@ def _ports_phrase(ports: list[PortSpec]) -> str:
         described.append(text)
     noun = "opening" if len(ports) == 1 else "openings"
     return f" Wall {noun}: " + "; ".join(described) + "."
+
+
+def _floor_holes_phrase(holes: "list[FloorHoleSpec]", wall: float) -> str:
+    """The floor-hole half of the read-back.
+
+    Says "right through" explicitly and gives the depth, because on screen a hole
+    through the base and a blind pocket look identical from above — and that
+    difference is the whole point of the feature.
+    """
+    if not holes:
+        return ""
+
+    listed = "; ".join(
+        f"({_fmt(hole.x)}, {_fmt(hole.y)}) {_fmt(hole.diameter)}mm "
+        + (
+            f"across the flats hex ({_fmt(2 * _floor_hole_radius(hole))}mm "
+            f"across the corners)"
+            if hole.shape == "hex"
+            else "dia"
+        )
+        for hole in holes
+    )
+    noun = "hole" if len(holes) == 1 else "holes"
+    return (
+        f" {len(holes)} floor {noun} from the interior centre: {listed}. "
+        f"Cut right through the {_fmt(wall)}mm base — open on the inside and "
+        f"on the outside."
+    )
+
+
+def _floor_slots_phrase(slots: "list[FloorSlotSpec]", wall: float) -> str:
+    """The floor-slot half of the read-back."""
+    if not slots:
+        return ""
+
+    listed = "; ".join(
+        f"({_fmt(slot.x)}, {_fmt(slot.y)}) {_fmt(slot.length)}x{_fmt(slot.width)}mm"
+        for slot in slots
+    )
+    noun = "slot" if len(slots) == 1 else "slots"
+    return (
+        f" {len(slots)} floor {noun} from the interior centre: {listed}. "
+        f"Cut right through the {_fmt(wall)}mm base."
+    )
 
 
 def _lid_posts_phrase(posts: "list[LidPostSpec]") -> str:
@@ -791,6 +1137,35 @@ def _standoff_hole(standoff: StandoffSpec, wall: float) -> Part:
     return cutter.locate(Location((standoff.x, standoff.y, wall + _BOSS_HOLE_STOP)))
 
 
+def _floor_hole_cutter(hole: "FloorHoleSpec", wall: float) -> Part:
+    """A prism spanning the base's full thickness, overshooting both faces.
+
+    Neither end is coincident with an existing face, for the same reason the cavity
+    pokes out of the top: a coincident boolean face is where OCC gets ambiguous.
+
+    A hex is drawn from its across-flats size, so the sketch takes the inradius —
+    ``major_radius=False``. That leaves two flats parallel to X and the points on
+    the X axis, which is how a nut sits in a drawing. A test pins that orientation,
+    because nothing else in here would notice it turning 30 degrees.
+    """
+    through = wall + 2 * _OVERCUT
+    if hole.shape == "hex":
+        cutter = extrude(
+            RegularPolygon(radius=hole.diameter / 2, side_count=6, major_radius=False),
+            amount=through,
+        )
+    else:
+        cutter = Cylinder(radius=hole.diameter / 2, height=through, align=_ON_BED)
+    return cutter.locate(Location((hole.x, hole.y, -_OVERCUT)))
+
+
+def _floor_slot_cutter(slot: "FloorSlotSpec", wall: float) -> Part:
+    """A rectangular prism spanning the base, overshooting both faces."""
+    return Box(
+        slot.length, slot.width, wall + 2 * _OVERCUT, align=_ON_BED
+    ).locate(Location((slot.x, slot.y, -_OVERCUT)))
+
+
 def box_with_lid(
     outer_l: float,
     outer_w: float,
@@ -803,6 +1178,8 @@ def box_with_lid(
     ports: list[PortSpec] | None = None,
     standoffs: list[StandoffSpec] | None = None,
     lid_posts: list[LidPostSpec] | None = None,
+    floor_holes: list[FloorHoleSpec] | None = None,
+    floor_slots: list[FloorSlotSpec] | None = None,
 ) -> tuple[Part, Part]:
     """Build a box body and a matching press-fit lid.
 
@@ -810,7 +1187,8 @@ def box_with_lid(
     ``None`` for wall / clearance / fillet / lip_height resolves from
     ``config/defaults.toml``. ``ports`` cuts rectangular windows through the
     walls; ``None`` or ``[]`` gives a sealed box. ``standoffs`` adds mounting
-    posts to the cavity floor; ``None`` or ``[]`` leaves it bare.
+    posts to the cavity floor; ``None`` or ``[]`` leaves it bare. ``floor_holes``
+    cuts straight through the base; ``None`` or ``[]`` leaves it solid.
 
     Returns ``(body, lid)``. Both sit on the Z=0 plane in print orientation:
     the body opening faces +Z, the lid rests plate-down with its lip pointing +Z.
@@ -837,6 +1215,8 @@ def box_with_lid(
     ports = list(ports or ())
     standoffs = list(standoffs or ())
     lid_posts = list(lid_posts or ())
+    floor_holes = list(floor_holes or ())
+    floor_slots = list(floor_slots or ())
     _validate(
         outer_l,
         outer_w,
@@ -848,6 +1228,8 @@ def box_with_lid(
         ports,
         standoffs,
         lid_posts,
+        floor_holes,
+        floor_slots,
     )
 
     inner_l = outer_l - 2 * wall
@@ -875,6 +1257,14 @@ def box_with_lid(
     for standoff in standoffs:
         if standoff.hole_diameter > 0:
             body = body - _standoff_hole(standoff, wall)
+
+    # Last, with the other holes: by here the base is final, so a floor hole is
+    # cut once through finished material rather than through something a later
+    # union might land on.
+    for hole in floor_holes:
+        body = body - _floor_hole_cutter(hole, wall)
+    for slot in floor_slots:
+        body = body - _floor_slot_cutter(slot, wall)
 
     # --- lid: plate at full outer dims, lip sized off the cavity ------------ #
     lip_l = inner_l - 2 * clearance
@@ -910,4 +1300,6 @@ def build(params: BoxWithLidParams) -> tuple[Part, Part]:
         ports=params.ports,
         standoffs=params.standoffs,
         lid_posts=params.lid_posts,
+        floor_holes=params.floor_holes,
+        floor_slots=params.floor_slots,
     )

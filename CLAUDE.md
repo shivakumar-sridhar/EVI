@@ -57,7 +57,7 @@ descriptions. If you ever find one holding only because of this file, that is th
   guarantee would die with nothing failing to say so.
 
 ## Testing
-- `pytest tests/` — 327 tests. Geometry tests assert on volume and bounding box, never
+- `pytest tests/` — 532 tests. Geometry tests assert on volume and bounding box, never
   exact meshes.
 - **Never test by starting a real print.** Use `slice_part` metadata. Refusal paths *are*
   testable live — they refuse. The upload leg is testable live only below MCP: call
@@ -73,16 +73,21 @@ descriptions. If you ever find one holding only because of this file, that is th
 
 ## Current state
 
-Seven MCP tools, three human gates. Everything below works and is verified live.
+Eight MCP tools, three human gates. Everything below works and is verified live.
 
 | Area | Module | Status |
 |---|---|---|
-| Templates | `templates/box.py` | `box_with_lid` + `ports`, `standoffs`, `lid_posts`. Printed and fitted. |
+| Templates | `templates/box.py` | `box_with_lid` + `ports`, `standoffs`, `lid_posts`, `floor_holes`, `floor_slots`. Printed and fitted. |
+| Templates | `templates/gear.py` | `gear_pair` + `pinion_counterbore`, `gear_hub` (pinch or grub), and `gear_fit_trial`. Pair printed; mesh not yet checked in the hand. |
+| Templates | `templates/yoke.py` | `encoder_yoke`. Geometry verified in tests; **not yet printed.** |
+| Templates | `templates/magnet_encoder_case.py` | `magnet_encoder_case` — AS5600 inverted over a magnet glued to a hinge. Geometry verified in tests; **awaiting real measurements, not yet printed.** |
+| Templates | `templates/mount.py` | `shaft_sensor_mount` — IMU on the shaft, the MVP route. Printed twice 2026-08-23, both finished. |
 | Geometry, plates, previews | `cad.py` | Done |
 | Slicing | `slicer.py` | Done. Case body: 55 layers, 4.28 g, 30m 16s |
 | Review windows | `viewer.py` | Done. Gate 1 on by default, Gate 2 opt-in |
 | Printer control | `printer.py`, `calibration.py` | Done. Real prints started, cancelled, calibrated |
 | MCP server | `server.py` | Done. Verified against a real client over a subprocess |
+| Design ledger | `design_log.py` | Done. `design_history` tool; `encoder-mount` v1/v2 backfilled |
 | Notifications | `notify.py` | Done. Separate process, systemd unit in `packaging/` |
 
 Removed: the voice frontend (`src/evee/voice/`). It worked; the client does it better.
@@ -236,6 +241,193 @@ Each line is a thing that cost time to learn. None of them are obvious from the 
   "this machine has a screen"; `gcode_auto_open` means "I want to look at toolpaths". The
   refusal message names whichever one vetoed, so nobody edits the wrong line.
 
+### `gear.py`
+- **The tooth count is the one number a volume assertion cannot see.** A gear with
+  the wrong count still has a plausible volume and a correct bounding box. Counting
+  is done by intersecting a thin annulus at the pitch circle and asserting the number
+  of *solids* that fall out — one island per tooth.
+- **A mesh test is the only test that matters, and it is easy to write so it proves
+  nothing.** Two gears sitting apart also fail to intersect. The test first asserts
+  the tip circles overlap by >1mm, so a zero intersection means interleaved teeth
+  with clearance rather than two parts that never met.
+- **The mesh phase must be baked into the geometry, not the part's location.**
+  `Shape.locate()` *replaces* a location, and `cad.arrange_along_x` moves every part
+  before export — a pinion phased by rotating the solid reaches the plate un-phased,
+  and nothing fails. The phase is an angular offset applied to the outline points.
+- **Odd tooth counts mesh unaided; even ones need half a pitch.** Teeth centred at
+  `2*pi*k/z` put a *space* at 180 degrees only when z is odd. Getting this backwards
+  collides one entire tooth, so both parities are in the test matrix.
+- **Order the validation so the root cause speaks first.** A backlash wider than the
+  tooth also makes the teeth run to a point, and the pointed-tooth message fired
+  first and sent you looking at tooth count. The backlash check now runs ahead of it.
+- **The polyline root sits microns inside the true root circle.** Root arcs are
+  sampled, so an exact containment assertion against `root_radius` fails by ~0.05mm3.
+  Physically irrelevant at a 0.4mm nozzle; worth knowing before you debug it.
+- **A feature that reaches past the tip circle must not sink into the toothed disc.**
+  The clamp hub's ear is unioned with a 1mm sink, the way `box._standoff_post` sinks a
+  post — and that sank a skirt through five tooth gaps out to r=17, in the exact band
+  the pinion sweeps. It crashes into the pinion once a revolution and on screen it
+  looks like a slightly chunky hub. The hub may sink (it lives inside the root circle,
+  where the disc is solid rim); the ear may not. `test_the_hub_keeps_clear_of_the_band_
+  the_pinion_sweeps` is the guard: no material outside the tip circle within the
+  meshing band, full stop.
+- **Geometry drawn along +Y is already 90 degrees round.** The clamp slit is placed at
+  the tooth gap nearest +Y, and rotating it *by* that angle rather than by the
+  difference put it at 180 degrees — a tooth centre on a 30-tooth gear, splitting a
+  tooth down the middle. Counting islands at the pitch circle catches it: a split
+  tooth is one island more than the gear has teeth.
+- **A pinch ear does not fit next to anything.** It needs ~9mm of radial depth for an
+  M3 and its nut, so it reaches well past the gear's own tip circle — fine on a bare
+  shaft, fatal beside a bracket the gear has to turn next to. `ClampHubSpec.style="grub"`
+  keeps every turning feature inside the hub. The guard is a test asserting no material
+  outside the hub radius, above the teeth.
+- **Refuse the other style's settings, never ignore them.** `model_fields_set` tells you
+  what was actually typed, so a `nut_across_flats` passed to a grub hub is a refusal
+  rather than a silently dropped field and a person certain they asked for a nut trap.
+- **Check grub screw spacing at the bore, not at the outside.** That is where the holes
+  are closest together; a pair that clears at the hub's OD can break into one slot on
+  the inside. Three M3 screws at 90 degrees pass an outside check and fail a 5mm bore.
+- **A nut trap wants an open top, not a closed pocket.** A pocket buried in the ear
+  needs a ceiling bridged in mid-air on a small part, and a drooped trap will not take
+  a nut. A hex pocket plus a channel to the top face has no ceiling anywhere, and the
+  nut drops in instead of being pressed into a slot it cannot reach.
+- **Counterbores open on +Z in print pose.** At the other end the step becomes a
+  ceiling bridging the bore, and a magnet seat that droops holds the magnet crooked —
+  which the AS5600 reports as a wobble in the angle rather than as a defect.
+- **Two openings a tenth of a millimetre apart are one opening.** Floor features are
+  checked for a real gap of `_MIN_FLOOR_HOLE_WALL`, not merely for non-overlap: a
+  0.4mm nozzle cannot lay a 0.1mm rib, so the part that arrives is not the part that
+  was checked. This caught a slot for the AS5600's STEMMA connectors leaving 0.098mm
+  of floor beside the hex sockets — the two would have merged and the sockets would
+  have stopped being sockets.
+- **Clearance to a rectangle is measured to its nearest edge, not its centre.**
+  `_slot_gap` clamps the point onto the rectangle first; measuring to the middle of a
+  25mm slot calls everything beside it comfortably clear.
+- **Undercut is reported, never refused.** Below `2/sin^2(a)` teeth the roots are
+  thinned, and printed gears run undercut all the time. The read-back says so.
+
+### `templates/__init__.py` — the registry reloads itself
+
+An MCP server is a subprocess the editor starts once and keeps for hours, and Python
+caches imported modules. Adding or editing a template was invisible until the client
+reconnected — five times in one session before anyone called it a bug. `refresh()`
+now stats the package's sources before every lookup and reloads what moved
+(`[templates] autoreload` in defaults.toml turns it off). Three things it has to get
+right, each of which failed first:
+
+- **Reloading one submodule is not enough.** `TEMPLATE_REGISTRY` holds direct
+  references to each params model and build function, captured when `__init__.py`
+  last ran. Reload `gear.py` alone and the registry still points at the old classes.
+  Any change reloads every template module *and then* this one.
+- **Which rebinds `TEMPLATE_REGISTRY` to a new dict.** Anything that did
+  `from evee.templates import TEMPLATE_REGISTRY` keeps the old one forever — the same
+  shape of bug as patching a name at its definition site while the caller holds the
+  value. Read it through `template_registry()`; `test_no_module_binds_the_registry_dict`
+  enforces it by introspection.
+- **`.pyc` validity is checked in whole seconds and file size.** Save a file twice
+  inside one second without changing its length — rename a string, flip a digit — and
+  `importlib.reload` reuses the previous bytecode, appearing to work while serving
+  the older code. Our stamps are nanoseconds, so we see the change the loader cannot;
+  `_drop_bytecode()` is what makes seeing it count. This was caught by an end-to-end
+  check that left a poisoned `.pyc` in the tree proving it.
+
+**`templates/errors.py` is never reloaded, and that is the whole reason it exists.**
+`importlib.reload` mints new class objects, so an `except TemplateError` held from
+before a reload does not catch what a freshly reloaded template raises: a tidy
+validation message becomes an unhandled exception, on the first call after an edit
+only. Adding the reload broke twenty tests exactly this way, every one of which
+passed when run alone. Adding a class to `errors.py` needs a real restart — that is
+the price of the classes being stable.
+
+### `yoke.py`
+- **Most of this part is defined by what it must not touch**, and keep-out shows up in
+  no volume and no bounding box. The tests probe it directly: a cylinder on the gear's
+  tip circle, through the whole band the gear could be mounted in, must intersect
+  nothing. Paired with an inverse test — grow the keep-out slightly and material *must*
+  appear — because a keep-out test passes trivially on a part that is simply too small.
+- **The air gap is specified to the top of the chip package, not to the board.** An
+  AS5600 in SOIC-8 stands ~1.75mm proud. Size the stack to the board face and the whole
+  assembly sits 1.75mm low, which is the pinion touching the chip. `board_face()` owns
+  that sum so it cannot be got wrong twice.
+- **Clearance to a swept circle is radial, not along one axis.** The near columns are
+  positioned by solving on the keep-out circle itself; adding the margin to X instead
+  leaves the column's inner *corner* short of it by however far the corner is off-axis
+  — 0.1mm here, and silently.
+- **Which constraint binds moved when the shaft did.** At 10mm the board's edge against
+  the turning shaft set the minimum centre distance; at 5mm it is the axle boss against
+  the gear's teeth, and the old reasoning still reads plausibly. A test pins the boss as
+  the limiter so the stale explanation cannot survive.
+- **The collar on the shaft is the datum, and that is the whole design.** Centre distance
+  becomes a dimension inside one printed part rather than a stack of mounting
+  tolerances, and the anti-rotation tether then needs no precision at all.
+
+### `design_log.py` — look it up, do not measure it
+
+`output/design_log.jsonl` records every design: name, version, date, parameters,
+read-back sentence, STL paths. `design_part(template, params, name=...)` writes it;
+`design_history(name=..., template=...)` reads it. **Consult it before iterating on
+anything that already exists** — "the mount", "make the holes bigger", "same but 8mm".
+
+- **It exists because the alternative was measuring a mesh.** Every parameter of the
+  encoder mount was recovered from its STL and confirmed by rebuilding to 0.016% of
+  the original volume. That worked, and it is not a method. A parameter choosing
+  between two equal-volume arrangements leaves no trace, and a defaulted value shows
+  its consequence but never the fact that nobody typed it.
+- **Two parameter sets are stored, and both are load-bearing.** `params` is the
+  resolved dump — every value, defaults filled in — and is what to *read*.
+  `params_input` is only what was passed, and is what to *rebuild from*. A full dump
+  marks every field as set, and `ClampHubSpec` refuses pinch-only fields on a grub hub
+  precisely *because they were set*, so **the model declines to accept its own dump.**
+  Keeping both also makes default drift visible: rebuild from `params_input`, dump it,
+  and any disagreement with `params` is a house default that has moved.
+- **Versions group under a name, not a template.** Two unrelated mounts are two parts,
+  not v1 and v2 of one, and no rule about which params "define" a part could separate
+  them without guessing. Iterating means passing the *same* name; a new name starts a
+  new history.
+- **An unchanged re-run does not mint a version.** The design gate is an iteration
+  loop by construction, so counting calls would number one shape v1–v9 and bury the
+  versions that differ. Only the immediately preceding version is compared — going
+  back to an earlier shape is a real event and is recorded.
+- **Writing here never fails a design.** Same rule as the print log: the STLs are
+  already on disk by then. `record_design` returns `None` rather than raising.
+- **A version rebuilds only while the template still accepts its parameters.** The
+  ledger records history; it cannot promise that a param which no longer exists will
+  still validate. `encoder-mount` v2 is already orphaned this way — it holds
+  `grub_lead_in`, which `grub_taper` replaced the same day. Its record still *reads*
+  fine, and that is the useful half; only feeding it back would fail. Renaming a
+  param strands every version that used it, so prefer adding one.
+- **`source` says how much to trust it.** `design_part` was captured live;
+  `reconstructed` was entered afterwards and the `note` says how it was derived. The
+  two `encoder-mount` versions are both `reconstructed` — they predate the ledger.
+- `conftest` isolates `evee.design_log.DESIGN_LOG`. A test that wrote to the real
+  ledger would file a fixture's throwaway box as a real part and march the version
+  numbers on every pytest run. **Patch the module, never `evee.config`** — and note a
+  *test module* doing `from evee.design_log import DESIGN_LOG` binds the value and
+  escapes the patch. That happened; it wrote junk into the real ledger.
+
+### `magnet_encoder_case.py`
+- **Inverting the board points *everything* at the magnet, not just the chip.** On an
+  Adafruit breakout the STEMMA connectors are on the same face and are far taller than
+  the sensor's 1.75mm, so on plain posts the *connectors* set the height and hold the
+  chip millimetres too high — while the part looks right. `underside_height` is a
+  required param for this reason, and the check fired the first time the template was
+  run on plausible numbers. It is the whole reason this is not `box_with_lid`.
+- **`board_face()` owns the sum**, as `yoke.board_face()` does: `magnet_proud +
+  air_gap + package_height`. A typed post height folds three measurements into one
+  unverifiable number, and the failure is silent — it assembles, it reads, the angle
+  is merely wrong.
+- **The glue line is in the stack and nothing in the part can see it.** A 0.2mm bead
+  adds 0.2mm to the air gap. The read-back says so; it is the only term not printed.
+- **The posts stand on the base plate, never on the handle.** Standing them on the
+  glued surface would leave four columns that are not one solid, held only by the
+  glue bead — at exactly the height the part exists to control.
+- **The window follows the sensor, not the board's centre.** The chip is not
+  necessarily centred on its board; centring the window instead reads an angle off a
+  magnet it is not over. `chip_offset_*` is the one measurement unrecoverable once
+  assembled.
+- **Sides are open on purpose.** Walls to the board face would sit where the STEMMA
+  cables leave, needing port cutouts whose positions are a fourth thing to measure.
+
 ### `printer.py`
 - **OctoPrint's start command takes no filename.** `POST /api/job {"command":"start"}`
   prints whatever is *currently selected* — possibly something a human picked in the web
@@ -388,8 +580,8 @@ The durable lessons, which are about method rather than about any one change.
 - **Adding a feature to a template has a fixed shape**: extend the params model → add
   cross-field checks to `_validate()` with a message naming the bad value → subtract/add
   geometry in the build function → assert on volume and bounding box in `tests/`. `ports`,
-  `standoffs` and `lid_posts` are the worked examples. New *dimensions* are free; new
-  *features* cost a change like this, and that is the intended trade.
+  `standoffs`, `lid_posts` and `floor_holes` are the worked examples. New *dimensions* are
+  free; new *features* cost a change like this, and that is the intended trade.
 - Previews are matplotlib-only (`Agg`). No pyrender/pyglet — offscreen GL on headless
   Linux is not worth the debugging time, and these images only need to answer "is the
   shape right".

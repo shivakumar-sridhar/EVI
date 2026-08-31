@@ -16,7 +16,7 @@ import trimesh
 from build123d import Compound, Location, Mesher, Part, export_stl
 
 from evee.config import OUTPUT_DIR, bed_violations, export_tolerances, plate_margin
-from evee.templates import TEMPLATE_REGISTRY, get_template
+from evee.templates import get_template, template_registry
 
 __all__ = [
     "DesignResult",
@@ -39,7 +39,19 @@ class DesignResult:
     """What Gate 1 shows the human."""
 
     template: str
+    #: Every parameter with its resolved value, defaults filled in. What to READ.
     params: dict
+    #: Only what was actually passed. What to REBUILD FROM.
+    #:
+    #: Both are needed and neither substitutes for the other. The resolved dump is
+    #: the honest record of what the values were, but some params models refuse it
+    #: back: ClampHubSpec rejects pinch-only fields on a grub hub, and a full dump
+    #: marks every field as set, so a model can decline to accept its own dump.
+    #: This one round-trips by construction, being exactly what did round-trip.
+    #:
+    #: Keeping both also makes default drift *visible*: rebuild from this, dump it,
+    #: and any disagreement with ``params`` is a house default that has moved since.
+    params_input: dict
     spec_sentence: str
     stl_paths: dict[str, Path]
     bounding_boxes: dict[str, tuple[float, float, float]]
@@ -126,6 +138,7 @@ def design(
     return DesignResult(
         template=spec.name,
         params=validated.model_dump(),
+        params_input=validated.model_dump(exclude_defaults=True),
         spec_sentence=spec.spec_sentence(validated),
         stl_paths=stl_paths,
         bounding_boxes=bounding_boxes,
@@ -332,4 +345,4 @@ def render_preview(stl_path: Path, output_dir: Path | None = None) -> list[Path]
 
 def list_templates() -> dict[str, str]:
     """Template name -> description. Phase 4 renders this into the prompt."""
-    return {name: spec.description for name, spec in TEMPLATE_REGISTRY.items()}
+    return {name: spec.description for name, spec in template_registry().items()}

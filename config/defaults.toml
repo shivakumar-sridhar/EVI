@@ -7,6 +7,20 @@ wall = 2.0        # mm
 fillet = 1.0      # mm, vertical edges
 lip_height = 3.0  # mm, how deep a press-fit lid lip engages the cavity
 
+[templates]
+# The MCP server is a subprocess your editor starts once and keeps for hours, and
+# Python caches imported modules. So a template added or edited while it runs was
+# invisible until the client reconnected — which is a thing about Python you should
+# not have to know in order to design a part.
+#
+# With this on, the registry stats the files behind it before every lookup and
+# reloads the ones whose source moved. A stat of a handful of files per tool call is
+# nothing next to a boolean operation in OpenCascade.
+#
+# A half-saved file with a syntax error is reported as a tool error rather than
+# silently serving the previous version, and the next call retries.
+autoreload = true
+
 [standoff]
 # Posts rising from the cavity floor that a PCB rests on, screws into, or both.
 # hole_diameter is a PILOT for a self-tapping screw cutting its own thread in

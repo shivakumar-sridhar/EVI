@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 
 import pytest
-from build123d import Align, Box, Location
+from build123d import Align, Box, Cylinder, Location
 from pydantic import ValidationError
 
 from evee.config import (
@@ -20,7 +20,10 @@ from evee.config import (
 )
 from evee.templates.box import (
     _BOSS_HOLE_STOP,
+    _MIN_FLOOR_HOLE_WALL,
     BoxWithLidParams,
+    FloorHoleSpec,
+    FloorSlotSpec,
     PortSpec,
     StandoffSpec,
     TemplateError,
@@ -443,6 +446,385 @@ def test_impossible_standoffs_are_rejected_with_a_message_naming_the_problem(
         box_with_lid(**EXPLICIT, standoffs=[StandoffSpec(**s) for s in standoffs])
     assert expected in str(excinfo.value)
     assert "standoffs[0]" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# Floor holes
+# --------------------------------------------------------------------------- #
+
+#: One hole through the middle of the base at the acceptance dimensions.
+FLOOR_HOLE = dict(x=0.0, y=0.0, diameter=5.2)
+
+#: What it removes: a plug of base, full wall thickness. The cutter overshoots
+#: both faces, but the overshoot is outside the solid and removes nothing.
+PLUG_VOLUME = math.pi * (FLOOR_HOLE["diameter"] / 2) ** 2 * WALL
+
+
+def test_a_floor_hole_removes_exactly_its_plug_of_base(parts):
+    bare, _ = parts
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(**FLOOR_HOLE)])
+
+    assert bare.volume - drilled.volume == pytest.approx(PLUG_VOLUME, rel=1e-4)
+    assert bbox_size(drilled) == pytest.approx(bbox_size(bare), abs=1e-6)
+
+
+def test_a_floor_hole_is_open_on_both_faces():
+    """The point of the feature: it must break the outside skin as well as the inside.
+
+    A blind pocket and a through hole are indistinguishable looking down at the
+    cavity, so this measures at both faces rather than at the volume. Slabs are
+    thin and offset inward from each face, so this reads the solid either side of
+    the boundary rather than the boundary itself.
+    """
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(**FLOOR_HOLE)])
+    radius = FLOOR_HOLE["diameter"] / 2
+
+    for z in (0.05, WALL - 0.05):
+        slab = Box(1000, 1000, 0.02, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        section = drilled & slab.locate(Location((0, 0, z)))
+        # A bore centred on the origin: nothing of the solid may reach into it.
+        column = Cylinder(
+            radius=radius - 1e-3, height=1.0, align=(Align.CENTER, Align.CENTER, Align.MIN)
+        )
+        assert (section & column.locate(Location((0, 0, z - 0.5)))).volume == (
+            pytest.approx(0.0, abs=1e-6)
+        )
+        # ...and the rest of the base is still there at both faces.
+        assert section.volume > 0.0
+
+
+def test_floor_holes_and_standoffs_coexist():
+    """The real case: a board on four posts with a hole through the middle."""
+    corners = [
+        StandoffSpec(x=sx * 15.0, y=sy * 12.0, diameter=4.0, height=4.0)
+        for sx in (1, -1)
+        for sy in (1, -1)
+    ]
+    posted, _ = box_with_lid(**EXPLICIT, standoffs=corners)
+    both, _ = box_with_lid(
+        **EXPLICIT, standoffs=corners, floor_holes=[FloorHoleSpec(**FLOOR_HOLE)]
+    )
+
+    assert posted.volume - both.volume == pytest.approx(PLUG_VOLUME, rel=1e-4)
+
+
+def test_two_floor_holes_each_remove_their_own_plug(parts):
+    bare, _ = parts
+    holes = [
+        FloorHoleSpec(x=-10.0, y=0.0, diameter=5.2),
+        FloorHoleSpec(x=10.0, y=0.0, diameter=5.2),
+    ]
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=holes)
+
+    assert bare.volume - drilled.volume == pytest.approx(2 * PLUG_VOLUME, rel=1e-4)
+
+
+def test_floor_holes_appear_in_the_read_back_sentence():
+    params = BoxWithLidParams(**EXPLICIT, floor_holes=[FloorHoleSpec(**FLOOR_HOLE)])
+    sentence = resolved_spec_sentence(params)
+
+    assert "1 floor hole" in sentence
+    assert "(0, 0) 5.2mm dia" in sentence
+    # The bit that separates it from a standoff's blind bore, in words.
+    assert "right through the 2mm base" in sentence
+
+
+def test_no_floor_holes_says_nothing_about_them():
+    assert "floor hole" not in resolved_spec_sentence(BoxWithLidParams(**EXPLICIT))
+
+
+@pytest.mark.parametrize(
+    "holes, standoffs, expected",
+    [
+        pytest.param(
+            [dict(x=22.0, y=0.0, diameter=5.0)],
+            [],
+            "the floor only runs to",
+            id="hole_runs_into_the_wall",
+        ),
+        pytest.param(
+            [dict(x=0.0, y=0.0, diameter=5.0), dict(x=3.0, y=0.0, diameter=5.0)],
+            [],
+            "run into each other",
+            id="holes_overlap",
+        ),
+        pytest.param(
+            [dict(x=0.0, y=0.0, diameter=5.0)],
+            [dict(x=2.0, y=0.0, diameter=6.0)],
+            "would cut into standoffs[0]",
+            id="hole_clips_a_standoff",
+        ),
+        pytest.param(
+            [dict(x=0.0, y=0.0, diameter=2.0)],
+            [dict(x=0.0, y=0.0, diameter=6.0)],
+            "would cut into standoffs[0]",
+            id="hole_inside_a_standoff",
+        ),
+    ],
+)
+def test_impossible_floor_holes_are_rejected_with_a_message_naming_the_problem(
+    holes, standoffs, expected
+):
+    with pytest.raises(TemplateError) as excinfo:
+        box_with_lid(
+            **EXPLICIT,
+            floor_holes=[FloorHoleSpec(**h) for h in holes],
+            standoffs=[StandoffSpec(**s) for s in standoffs],
+        )
+    assert expected in str(excinfo.value)
+    assert "floor_holes[0]" in str(excinfo.value)
+
+
+def test_a_hole_right_at_the_wall_margin_is_the_boundary():
+    """The margin is a real limit, not a rounding: one side of it builds, the other
+    is refused. Guards against the check drifting into an off-by-a-radius."""
+    inner_half = (ACCEPTANCE["outer_l"] - 2 * WALL) / 2
+    radius = 2.5
+    just_inside = inner_half - radius - _MIN_FLOOR_HOLE_WALL - 0.01
+
+    body, _ = box_with_lid(
+        **EXPLICIT, floor_holes=[FloorHoleSpec(x=just_inside, y=0.0, diameter=2 * radius)]
+    )
+    assert body.volume > 0
+
+    with pytest.raises(TemplateError):
+        box_with_lid(
+            **EXPLICIT,
+            floor_holes=[FloorHoleSpec(x=just_inside + 0.02, y=0.0, diameter=2 * radius)],
+        )
+
+
+#: An M2.5 hex spacer is 5mm across the flats; 0.2 gets it in without slop.
+HEX_HOLE = dict(x=0.0, y=0.0, diameter=5.2, shape="hex")
+
+#: Area of a regular hexagon from its across-flats size, times the base thickness.
+HEX_PLUG_VOLUME = (3**0.5 / 2) * HEX_HOLE["diameter"] ** 2 * WALL
+
+
+def test_a_hex_floor_hole_removes_a_hexagonal_plug(parts):
+    """Sized across the flats, so the plug is sqrt(3)/2 * a^2 — not pi r^2."""
+    bare, _ = parts
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(**HEX_HOLE)])
+
+    assert bare.volume - drilled.volume == pytest.approx(HEX_PLUG_VOLUME, rel=1e-4)
+    assert bbox_size(drilled) == pytest.approx(bbox_size(bare), abs=1e-6)
+
+
+def test_a_hex_hole_is_not_just_a_round_one():
+    """The distinguishing property, measured rather than assumed.
+
+    Nothing inside the inscribed circle (across the flats) survives, but material
+    does survive inside the circumscribed one (across the corners) — that leftover
+    at the flats is exactly what stops a spacer turning. A round hole of either
+    diameter would fail one of these two.
+    """
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(**HEX_HOLE)])
+    across_flats = HEX_HOLE["diameter"]
+    across_corners = across_flats * 2 / 3**0.5
+
+    def material_within(diameter: float) -> float:
+        probe = Cylinder(
+            radius=diameter / 2, height=WALL, align=(Align.CENTER, Align.CENTER, Align.MIN)
+        )
+        return (drilled & probe).volume
+
+    assert material_within(across_flats - 1e-3) == pytest.approx(0.0, abs=1e-6)
+    assert material_within(across_corners) > 0.1
+
+
+def test_a_hex_floor_hole_sits_flat_side_up():
+    """Points on X, flats parallel to X — a nut's orientation in a drawing.
+
+    Turning it 30 degrees would still print, still pass every volume check, and
+    still be wrong for anyone lining hardware up against the box's own axes.
+    """
+    drilled, _ = box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(**HEX_HOLE)])
+    across_flats = HEX_HOLE["diameter"]
+    across_corners = across_flats * 2 / 3**0.5
+
+    # The hole is the void in a thin slab of the base, so measure the slab's solid
+    # and subtract it from a plug that spans the whole hole.
+    slab = Box(1000, 1000, 0.02, align=(Align.CENTER, Align.CENTER, Align.MIN))
+    section = drilled & slab.locate(Location((0, 0, WALL / 2)))
+    plug = Box(20, 20, 0.02, align=(Align.CENTER, Align.CENTER, Align.MIN))
+    void = plug.locate(Location((0, 0, WALL / 2))) - section
+
+    size = void.bounding_box().size
+    assert size.X == pytest.approx(across_corners, abs=1e-3)
+    assert size.Y == pytest.approx(across_flats, abs=1e-3)
+
+
+def test_a_hex_hole_is_checked_against_its_corners_not_its_flats():
+    """The 15% a hex hides. Across the flats it fits; across the corners it does not,
+    and the corners are what actually breaks into the wall."""
+    inner_half = (ACCEPTANCE["outer_w"] - 2 * WALL) / 2
+    across_flats = 5.2
+    # Clears with room to spare if you (wrongly) measure across the flats...
+    y = inner_half - across_flats / 2 - _MIN_FLOOR_HOLE_WALL - 0.05
+
+    box_with_lid(**EXPLICIT, floor_holes=[FloorHoleSpec(x=0.0, y=y, diameter=across_flats)])
+
+    # ...and the same position is refused once it is a hex.
+    with pytest.raises(TemplateError) as excinfo:
+        box_with_lid(
+            **EXPLICIT,
+            floor_holes=[
+                FloorHoleSpec(x=0.0, y=y, diameter=across_flats, shape="hex")
+            ],
+        )
+    assert "across the corners" in str(excinfo.value)
+
+
+def test_hex_holes_appear_in_the_read_back_sentence():
+    params = BoxWithLidParams(**EXPLICIT, floor_holes=[FloorHoleSpec(**HEX_HOLE)])
+    sentence = resolved_spec_sentence(params)
+
+    assert "5.2mm across the flats hex" in sentence
+    # The number that says whether it clears the thing next to it.
+    assert "6.004mm across the corners" in sentence
+
+
+def test_a_floor_hole_is_round_unless_asked_otherwise():
+    """The default cannot drift: a hex where a round hole was meant is a part that
+    fits nothing."""
+    assert FloorHoleSpec(x=0.0, y=0.0, diameter=5.0).shape == "round"
+    with pytest.raises(ValidationError):
+        FloorHoleSpec(x=0.0, y=0.0, diameter=5.0, shape="octagon")
+
+
+# --------------------------------------------------------------------------- #
+# Floor slots
+# --------------------------------------------------------------------------- #
+
+#: Clears a pair of STEMMA QT connectors on a board mounted face-down.
+SLOT = dict(x=0.0, y=0.0, length=24.5, width=6.5)
+
+SLOT_CASE = dict(outer_l=33.0, outer_w=25.4, outer_h=12.0, wall=WALL,
+            clearance=CLEARANCE, fillet=FILLET, lip_height=LIP_HEIGHT)
+
+
+def test_a_floor_slot_removes_its_own_prism():
+    bare, _ = box_with_lid(**SLOT_CASE)
+    slotted, _ = box_with_lid(**SLOT_CASE, floor_slots=[FloorSlotSpec(**SLOT)])
+
+    prism = SLOT["length"] * SLOT["width"] * WALL
+    assert bare.volume - slotted.volume == pytest.approx(prism, rel=1e-6)
+    assert bbox_size(slotted) == pytest.approx(bbox_size(bare), abs=1e-6)
+
+
+def test_a_floor_slot_is_open_on_both_faces():
+    """The point of it: a connector has to pass through, not sit in a tray."""
+    slotted, _ = box_with_lid(**SLOT_CASE, floor_slots=[FloorSlotSpec(**SLOT)])
+    plug = Box(
+        SLOT["length"] - 0.02, SLOT["width"] - 0.02, WALL,
+        align=(Align.CENTER, Align.CENTER, Align.MIN),
+    )
+    assert (slotted & plug).volume == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_slot_that_would_merge_with_a_hole_is_refused():
+    """The real case this feature was built for, and the one that would have been
+    printed: a 5.2mm hex socket 6.35mm out leaves a tenth of a millimetre of floor
+    beside a 6.5mm slot. Not an overlap — a wall no nozzle can lay down, so the two
+    arrive as one opening and the sockets stop being sockets.
+    """
+    hexes = [
+        FloorHoleSpec(x=sx * 10.16, y=sy * 6.35, diameter=5.2, shape="hex")
+        for sx in (1, -1)
+        for sy in (1, -1)
+    ]
+    with pytest.raises(TemplateError) as excinfo:
+        box_with_lid(**SLOT_CASE, floor_holes=hexes, floor_slots=[FloorSlotSpec(**SLOT)])
+
+    message = str(excinfo.value)
+    assert "become one opening on the printer" in message
+    assert "0.098mm of floor" in message
+
+
+def test_smaller_holes_in_the_same_place_are_accepted():
+    """Same positions, M2.5 clearance instead of a hex socket: 1.65mm of floor, and
+    it builds. The refusal above is about the size, not the position."""
+    holes = [
+        FloorHoleSpec(x=sx * 10.16, y=sy * 6.35, diameter=2.9)
+        for sx in (1, -1)
+        for sy in (1, -1)
+    ]
+    body, _ = box_with_lid(**SLOT_CASE, floor_holes=holes, floor_slots=[FloorSlotSpec(**SLOT)])
+    assert body.volume > 0
+
+
+def test_clearance_to_a_slot_is_measured_to_its_nearest_edge():
+    """Measuring to the slot's centre would call anything beside a long slot clear.
+    A feature level with the slot's middle and one beside its end must read the same
+    gap, because they are the same distance from the metal."""
+    holes = [
+        FloorHoleSpec(x=0.0, y=6.0, diameter=2.9),
+        FloorHoleSpec(x=11.0, y=6.0, diameter=2.9),
+    ]
+    body, _ = box_with_lid(**SLOT_CASE, floor_holes=holes, floor_slots=[FloorSlotSpec(**SLOT)])
+    assert body.volume > 0
+
+    # Bring either one in by the same amount and both must be refused.
+    for x in (0.0, 11.0):
+        with pytest.raises(TemplateError):
+            box_with_lid(
+                **SLOT_CASE,
+                floor_holes=[FloorHoleSpec(x=x, y=4.2, diameter=2.9)],
+                floor_slots=[FloorSlotSpec(**SLOT)],
+            )
+
+
+@pytest.mark.parametrize(
+    "slot, extra, expected",
+    [
+        pytest.param(
+            {**SLOT, "length": 40.0}, {},
+            "the floor only runs to",
+            id="slot_runs_into_the_wall",
+        ),
+        pytest.param(
+            SLOT,
+            {"standoffs": [StandoffSpec(x=0.0, y=5.0, diameter=6.0)]},
+            "undercuts standoffs[0]",
+            id="slot_undercuts_a_standoff",
+        ),
+        pytest.param(
+            SLOT,
+            {"floor_slots_extra": FloorSlotSpec(x=0.0, y=6.0, length=10.0, width=4.0)},
+            "would run into each other",
+            id="two_slots_collide",
+        ),
+    ],
+)
+def test_impossible_floor_slots_are_rejected(slot, extra, expected):
+    slots = [FloorSlotSpec(**slot)]
+    second = extra.pop("floor_slots_extra", None)
+    if second is not None:
+        slots.append(second)
+
+    with pytest.raises(TemplateError) as excinfo:
+        box_with_lid(**SLOT_CASE, floor_slots=slots, **extra)
+    assert expected in str(excinfo.value)
+
+
+def test_floor_slots_appear_in_the_read_back():
+    params = BoxWithLidParams(**SLOT_CASE, floor_slots=[FloorSlotSpec(**SLOT)])
+    sentence = resolved_spec_sentence(params)
+    assert "1 floor slot" in sentence
+    assert "(0, 0) 24.5x6.5mm" in sentence
+
+
+def test_floor_slot_model_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        FloorSlotSpec(x=0.0, y=0.0, length=10.0, width=5.0, depth=2.0)
+
+
+def test_floor_hole_model_rejects_unknown_fields():
+    """extra='forbid' holds for this nested model too — nesting is where it leaks."""
+    with pytest.raises(ValidationError):
+        FloorHoleSpec(x=0.0, y=0.0, diameter=5.0, depth=2.0)
+    with pytest.raises(ValidationError):
+        FloorHoleSpec(x=0.0, y=0.0, diameter=0.0)
 
 
 def test_standoff_model_rejects_unknown_fields():

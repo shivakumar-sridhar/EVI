@@ -78,6 +78,26 @@ def isolated_audit_log(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_design_log(tmp_path_factory, monkeypatch):
+    """Keep test designs out of the real output/design_log.jsonl.
+
+    The ledger is what a later session reads instead of measuring an STL, so a run
+    of the suite must not add parts to it — a fixture's throwaway 25mm box would
+    otherwise sit in the history looking exactly as real as the encoder mount, and
+    version numbers for real parts would march on every time anyone ran pytest.
+
+    Patched on ``evee.design_log`` rather than ``evee.config``: the module binds
+    ``OUTPUT_DIR`` at import, so patching the definition site would silently do
+    nothing — the same trap ``offline_printer_credentials`` documents.
+
+    Returns the scratch path so a test can seed or inspect it.
+    """
+    path = tmp_path_factory.mktemp("designs") / "design_log.jsonl"
+    monkeypatch.setattr("evee.design_log.DESIGN_LOG", path)
+    return path
+
+
+@pytest.fixture(autouse=True)
 def isolated_mesh_state(tmp_path_factory, monkeypatch):
     """Keep test runs from claiming the real printer has a stored bed mesh.
 

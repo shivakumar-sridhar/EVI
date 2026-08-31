@@ -33,6 +33,19 @@ def geometry_defaults() -> dict[str, float]:
     return dict(load_defaults()["geometry"])
 
 
+def template_autoreload() -> bool:
+    """Whether the template registry reloads source that has changed on disk.
+
+    On, because an MCP server is a long-lived subprocess started by an editor: it
+    imports the templates once and then serves a design tool for hours. Adding a
+    template used to mean restarting the client to see it, which is a strange thing
+    to have to know about a design tool.
+
+    Turn it off for a server that should never pick up edited code mid-session.
+    """
+    return bool(load_defaults().get("templates", {}).get("autoreload", True))
+
+
 def standoff_defaults() -> dict[str, float]:
     """PCB standoff post diameter, height and screw pilot diameter — all mm."""
     return dict(load_defaults()["standoff"])

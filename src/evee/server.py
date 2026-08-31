@@ -62,10 +62,11 @@ from pydantic import ValidationError
 from evee.cad import design
 from evee.calibration import mesh_state
 from evee.config import OUTPUT_DIR
+from evee.design_log import history, record_design
 from evee.printer import OctoPrintClient, PrinterError
 from evee.slicer import SlicerError, slice_stl
-from evee.templates import TEMPLATE_REGISTRY, UnknownTemplateError, get_template
-from evee.templates.box import TemplateError
+from evee.templates import UnknownTemplateError, get_template, template_registry
+from evee.templates.errors import TemplateError
 from evee.viewer import open_gcode, open_model
 
 __all__ = ["build_server", "main"]
@@ -79,8 +80,15 @@ do not approximate with a template that does not fit.
 
 Workflow, with a human decision between every step:
 
+  0. design_history(...)       - has this part been designed before? If the request
+     touches anything that already exists ("the mount", "make the holes bigger",
+     "same but 8mm"), start here and take the previous version's params. Do NOT
+     reconstruct parameters from an STL while the ledger has them: a mesh cannot
+     tell you which values were typed and which were defaulted.
   1. list_templates()          - what exists, and each template's parameter schema
-  2. design_part(...)          - builds STLs and opens them in a 3D viewer
+  2. design_part(...)          - builds STLs and opens them in a 3D viewer.
+     Pass name= so the design is recorded under it. Iterating on an existing part
+     means passing the SAME name it is already filed under.
   3. ** GATE 1: the human approves the shape, or asks for changes **
      Changes mean calling design_part() again with adjusted parameters. Iterate here
      as many times as it takes; this step is cheap and reversible.
@@ -179,11 +187,13 @@ def build_server() -> MCPServer:
                 "part_names": list(spec.part_names),
                 "schema": spec.params_model.model_json_schema(),
             }
-            for name, spec in TEMPLATE_REGISTRY.items()
+            for name, spec in template_registry().items()
         }
 
     @server.tool()
-    def design_part(template: str, params: dict[str, Any]) -> dict[str, Any]:
+    def design_part(
+        template: str, params: dict[str, Any], name: str | None = None
+    ) -> dict[str, Any]:
         """Build a part from a template and export STLs plus preview images.
 
         Args:
@@ -192,6 +202,12 @@ def build_server() -> MCPServer:
             params: Parameters for that template, matching its schema from
                 list_templates(). Unknown keys are rejected rather than ignored.
                 Omit a parameter to take the house default; do not guess a value.
+            name: What this part is called, e.g. "encoder mount". Versions group
+                under it, so iterating on an existing part means passing the SAME
+                name it was designed under — check design_history() first. Omit it
+                only for a genuinely new part with no name yet; it then falls back
+                to the template name, and two unrelated parts built from one
+                template will collide under it.
 
         On success the exported STLs are opened in a desktop 3D viewer so the user
         can orbit the real mesh. Returns the resolved spec sentence, per-part STL
@@ -219,7 +235,7 @@ def build_server() -> MCPServer:
         try:
             spec = get_template(template)
         except UnknownTemplateError:
-            known = ", ".join(sorted(TEMPLATE_REGISTRY))
+            known = ", ".join(sorted(template_registry()))
             raise ValueError(
                 f"unknown template {template!r}; this server builds only: {known}. "
                 f"There is no freeform geometry fallback — if none of these fit the "
@@ -242,6 +258,23 @@ def build_server() -> MCPServer:
         )
         launch = open_model(showing)
 
+        # Recorded after the export, for the same reason the viewer is launched
+        # after it: the parts are the deliverable and neither of these may fail
+        # them. record_design returns None rather than raising if it cannot write.
+        boxes = {
+            k: {"x": x, "y": y, "z": z}
+            for k, (x, y, z) in result.bounding_boxes.items()
+        }
+        entry = record_design(
+            template=result.template,
+            params=result.params,
+            params_input=result.params_input,
+            spec_sentence=result.spec_sentence,
+            stl_paths=result.stl_paths,
+            bounding_boxes=boxes,
+            name=name,
+        )
+
         return {
             "template": result.template,
             "spec_sentence": result.spec_sentence,
@@ -261,10 +294,27 @@ def build_server() -> MCPServer:
                     "and the nozzle travels between them on each layer."
                 ),
             },
-            "bounding_boxes": {
-                k: {"x": x, "y": y, "z": z}
-                for k, (x, y, z) in result.bounding_boxes.items()
-            },
+            "bounding_boxes": boxes,
+            "design": (
+                {
+                    "name": entry.record.name,
+                    "version": entry.record.version,
+                    "designed_at": entry.record.designed_at.isoformat(
+                        timespec="seconds"
+                    ),
+                    "new_version": entry.created,
+                    "note": (
+                        None
+                        if entry.created
+                        else (
+                            "Identical to the standing version, so nothing was "
+                            "recorded — this is the same design, not a new one."
+                        )
+                    ),
+                }
+                if entry
+                else None
+            ),
             "preview_paths": {
                 k: [str(p) for p in v] for k, v in result.preview_paths.items()
             },
@@ -281,6 +331,74 @@ def build_server() -> MCPServer:
                 "they approve, slice the plate — it prints every part in one job, "
                 "positioned exactly as shown. Slice a single part's STL only if they "
                 "want just that part, or if the plate does not fit the bed."
+            ),
+        }
+
+    @server.tool()
+    def design_history(
+        name: str | None = None, template: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """Look up what has been designed before, with the parameters it was built from.
+
+        CALL THIS BEFORE design_part whenever the request touches something that
+        already exists — "the mount", "make the holes bigger", "same but 8mm". The
+        recorded parameters are the resolved ones, so a previous version can be
+        rebuilt exactly: take its "params", change what the user asked for, and pass
+        the rest through unchanged.
+
+        Do not reconstruct parameters from an STL, and do not re-derive them from a
+        spec sentence, while this tool has them. A mesh cannot tell you which values
+        were typed and which were defaulted, and it cannot tell you anything at all
+        about a parameter two settings of which produce the same solid.
+
+        Args:
+            name: A part name, e.g. "encoder mount". Omit to list every part.
+            template: Restrict to one template, e.g. "shaft_sensor_mount".
+            limit: Most versions to return, newest first.
+
+        Returns "parts": a mapping of part name to its versions, each with the
+        version number, design date, resolved params, spec sentence, STL paths and
+        bounding boxes. "source" says how the record got there: "design_part" was
+        captured as the part was built; "reconstructed" was measured off a mesh
+        afterwards and carries a note saying how far it was verified.
+
+        An empty result means the part is not in the ledger — which for anything
+        designed before the ledger existed is silence, not proof it was never made.
+        """
+        try:
+            records = history(name=name, template=template, limit=limit)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
+
+        parts: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            parts.setdefault(record.name, []).append(
+                {
+                    "version": record.version,
+                    "designed_at": record.designed_at.isoformat(timespec="seconds"),
+                    "template": record.template,
+                    "source": record.source,
+                    "note": record.note,
+                    "spec_sentence": record.spec_sentence,
+                    "params": record.params,
+                    "params_input": record.params_input,
+                    "stl_paths": record.stl_paths,
+                    "bounding_boxes": record.bounding_boxes,
+                }
+            )
+        return {
+            "parts": parts,
+            "count": len(records),
+            "next_step": (
+                "To iterate on one of these, call design_part with the SAME name and "
+                "that version's params with only the requested change applied. To "
+                "start something genuinely separate, use a new name."
+            )
+            if records
+            else (
+                "Nothing recorded under that name. Check design_history() with no "
+                "arguments for the names that do exist before treating this as a new "
+                "part — it may have been designed under a different one."
             ),
         }
 
